@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# claude-peer — agent-to-agent comms primitive.
+#
+# Five verbs:
+#   claude-peer register <name>           declare this process as <name>
+#   claude-peer send <peer> "<message>"   append to peer's inbox
+#   claude-peer inbox                     read your inbox
+#   claude-peer listen                    tail your inbox to stdout
+#   claude-peer peers                     list registered peers + last-seen
+#   claude-peer whoami                    echo your registered name
+#
+# State lives at $CLAUDE_PEER_HOME (default ~/.claude-peer/<name>/):
+#   meta.json      name, started_at, pwd
+#   heartbeat      mtime touched on every command
+#   inbox.jsonl    append-only — what others sent us
+#   outbox.jsonl   append-only — what we sent
+#
+# No daemon. No port. No cloud. Just files.
+
+set -euo pipefail
+
+HOME_DIR="${CLAUDE_PEER_HOME:-$HOME/.claude-peer}"
+mkdir -p "$HOME_DIR"
+
+ME_FILE="$HOME_DIR/.me"  # records the current shell's registered name
+
+# ── helpers ──────────────────────────────────────────────────
+
+now_iso() { date +"%Y-%m-%dT%H:%M:%S%z"; }
+now_epoch() { date +%s; }
+
+current_name() {
+  if [[ -n "${CLAUDE_PEER_NAME:-}" ]]; then
+    printf '%s' "$CLAUDE_PEER_NAME"
+  elif [[ -f "$ME_FILE" ]]; then
+    cat "$ME_FILE"
+  else
+    return 1
+  fi
+}
+
+require_name() {
+  local name
+  if ! name=$(current_name); then
+    echo "claude-peer: no name registered. run 'claude-peer register <name>' first." >&2
+    echo "  or export CLAUDE_PEER_NAME=<name>" >&2
+    exit 1
+  fi
+  printf '%s' "$name"
+}
+
+touch_heartbeat() {
+  local name="$1"
+  touch "$HOME_DIR/$name/heartbeat" 2>/dev/null || true
+}
+
+# JSON-escape a string via python (portable, no jq dependency).
+jsonify() {
+  python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().rstrip("\n")))'
+}
+
+# ── commands ─────────────────────────────────────────────────
+
+cmd_register() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: claude-peer register <name>" >&2
+    exit 1
+  fi
+  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "claude-peer: name must match [a-zA-Z0-9_-]+" >&2
+    exit 1
+  fi
+  local sdir="$HOME_DIR/$name"
+  mkdir -p "$sdir"
+  cat > "$sdir/meta.json" <<JSON
+{"name":"$name","started_at":"$(now_iso)","pwd":"$PWD"}
+JSON
+  touch "$sdir/inbox.jsonl" "$sdir/outbox.jsonl" "$sdir/heartbeat"
+  echo "$name" > "$ME_FILE"
+  echo "registered as $name"
+}
+
+cmd_whoami() {
+  current_name && echo "" || { echo "(unregistered)"; exit 1; }
+}
+
+cmd_send() {
+  local to="${1:-}"
+  shift || true
+  local body="${*:-}"
+  if [[ -z "$to" || -z "$body" ]]; then
+    echo "usage: claude-peer send <peer> \"<message>\"" >&2
+    exit 1
+  fi
+  local from
+  from=$(require_name)
+  local target="$HOME_DIR/$to"
+  if [[ ! -d "$target" ]]; then
+    echo "claude-peer: no such peer: $to" >&2
+    echo "  run 'claude-peer peers' to see who's registered" >&2
+    exit 1
+  fi
+  local body_json
+  body_json=$(printf '%s' "$body" | jsonify)
+  local id
+  id=$(python3 -c 'import time,os,binascii; print(format(int(time.time()*1000),"x")+binascii.hexlify(os.urandom(4)).decode())')
+  local at
+  at=$(now_iso)
+  printf '{"id":"%s","from":"%s","to":"%s","at":"%s","body":%s}\n' \
+    "$id" "$from" "$to" "$at" "$body_json" >> "$target/inbox.jsonl"
+  printf '{"id":"%s","from":"%s","to":"%s","at":"%s","body":%s}\n' \
+    "$id" "$from" "$to" "$at" "$body_json" >> "$HOME_DIR/$from/outbox.jsonl"
+  touch_heartbeat "$from"
+  echo "→ $to: $body"
+}
+
+cmd_inbox() {
+  local name
+  name=$(require_name)
+  local inbox="$HOME_DIR/$name/inbox.jsonl"
+  if [[ ! -s "$inbox" ]]; then
+    echo "(inbox empty)"
+    return 0
+  fi
+  python3 - "$inbox" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try:
+        m = json.loads(line)
+        t = m.get("at","")[11:16]
+        print(f"[{t}] {m.get('from','?')}: {m.get('body','')}")
+    except Exception:
+        print(line.rstrip())
+PY
+  touch_heartbeat "$name"
+}
+
+cmd_listen() {
+  local name
+  name=$(require_name)
+  local inbox="$HOME_DIR/$name/inbox.jsonl"
+  touch "$inbox"
+  touch_heartbeat "$name"
+  exec tail -F -n 0 "$inbox" 2>/dev/null
+}
+
+cmd_peers() {
+  local me
+  me=$(current_name 2>/dev/null || echo "")
+  local n=0
+  printf "%-20s %-10s %s\n" "name" "last seen" "pwd"
+  printf "%-20s %-10s %s\n" "----" "---------" "---"
+  for d in "$HOME_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    local name
+    name=$(basename "$d")
+    [[ "$name" == .* ]] && continue
+    n=$((n + 1))
+    local hb_age="?"
+    if [[ -f "$d/heartbeat" ]]; then
+      local mt
+      mt=$(stat -f %m "$d/heartbeat" 2>/dev/null || stat -c %Y "$d/heartbeat" 2>/dev/null || echo 0)
+      local age=$(( $(now_epoch) - mt ))
+      if (( age < 60 )); then hb_age="${age}s"
+      elif (( age < 3600 )); then hb_age="$((age/60))m"
+      elif (( age < 86400 )); then hb_age="$((age/3600))h"
+      else hb_age="$((age/86400))d"
+      fi
+    fi
+    local pwd_str=""
+    if [[ -f "$d/meta.json" ]]; then
+      pwd_str=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pwd",""))' "$d/meta.json" 2>/dev/null || echo "")
+    fi
+    local marker=""
+    [[ "$name" == "$me" ]] && marker=" *"
+    printf "%-20s %-10s %s\n" "$name$marker" "$hb_age" "$pwd_str"
+  done
+  if (( n == 0 )); then
+    echo "(no peers registered)"
+  fi
+}
+
+cmd_unregister() {
+  local name
+  name=$(require_name)
+  rm -rf "$HOME_DIR/$name"
+  rm -f "$ME_FILE"
+  echo "unregistered $name"
+}
+
+cmd_help() {
+  cat <<HELP
+claude-peer — agent-to-agent comms primitive
+
+  register <name>           declare this process as <name>
+  send <peer> "<message>"   append to peer's inbox
+  inbox                     read your inbox
+  listen                    tail your inbox to stdout (line-buffered JSON)
+  peers                     list registered peers + last-seen
+  whoami                    echo your registered name
+  unregister                remove your registration
+  help                      this screen
+
+state: \$CLAUDE_PEER_HOME (default ~/.claude-peer/)
+override your name for one command: CLAUDE_PEER_NAME=<name> claude-peer send ...
+
+repo:  https://github.com/ferazfhansurie/claude-peer
+HELP
+}
+
+# ── dispatch ─────────────────────────────────────────────────
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+case "$cmd" in
+  register|whoami|send|inbox|listen|peers|unregister|help) "cmd_$cmd" "$@" ;;
+  -h|--help) cmd_help ;;
+  *) echo "claude-peer: unknown command: $cmd" >&2; cmd_help; exit 1 ;;
+esac
