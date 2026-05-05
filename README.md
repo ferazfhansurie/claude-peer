@@ -120,7 +120,7 @@ i was running three claude code sessions in parallel — one per repo, one per b
 
 so i wrote this. the whole tool is in [`bin/claude-peer`](bin/claude-peer). go read it.
 
-day 7 of [30 days, 30 tools](https://github.com/ferazfhansurie).
+day 6 of [30 days, 30 tools](https://github.com/ferazfhansurie).
 
 ## license
 
