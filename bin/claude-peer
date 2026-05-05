@@ -112,6 +112,17 @@ cmd_send() {
   printf '{"id":"%s","from":"%s","to":"%s","at":"%s","body":%s}\n' \
     "$id" "$from" "$to" "$at" "$body_json" >> "$HOME_DIR/$from/outbox.jsonl"
   touch_heartbeat "$from"
+
+  # Optional tmux auto-poke. If both peers are running inside tmux and the
+  # peer's tmux session matches its claude-peer name, send an Enter keystroke
+  # to its pane so the recipient's UserPromptSubmit hook fires immediately.
+  # Set CLAUDE_PEER_NO_POKE=1 to disable.
+  if [[ "${CLAUDE_PEER_NO_POKE:-0}" != "1" ]] && command -v tmux >/dev/null 2>&1; then
+    if tmux has-session -t "$to" 2>/dev/null; then
+      tmux send-keys -t "$to" "." Enter 2>/dev/null || true
+    fi
+  fi
+
   echo "→ $to: $body"
 }
 

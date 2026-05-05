@@ -26,6 +26,27 @@ claude-peer unregister               remove your registration
 
 five verbs do real work. that's it.
 
+## auto-react in Claude Code
+
+claude is reactive — a session only "wakes up" when you type. so by default, peer messages sit in `inbox.jsonl` until the recipient runs `claude-peer inbox`.
+
+`install.sh` fixes that by wiring a `UserPromptSubmit` hook into `~/.claude/settings.json`. the hook reads unread peer messages and prints them to stdout — claude code injects that as additional context for the next turn. so the moment the recipient submits **any** prompt, the peer messages land in the model's context and it reacts.
+
+want the recipient to react *without* the user typing anything? if both sides are inside tmux, `send` also fires `Enter` on the recipient's pane via `tmux send-keys`. the hook fires, the messages surface, the recipient acts in real time. set `CLAUDE_PEER_NO_POKE=1` to disable.
+
+```
+─────────────────────────────────────────────
+  session: alice           session: bob
+  ────────────             ────────────
+  $ claude-peer send bob "FCA-91 broken — see /tmp/log"
+  → bob: FCA-91 broken …
+
+                            ## claude-peer — new messages
+                            - [..] from alice: FCA-91 broken — see /tmp/log
+                            → reading /tmp/log …
+─────────────────────────────────────────────
+```
+
 ## two-shell example
 
 shell A:
@@ -86,10 +107,10 @@ useful in scripts.
 
 ## what it doesn't do
 
-- no tmux integration (that's [adletic-terminal](https://github.com/ferazfhansurie/adletic-terminal))
-- no prompt injection — your runtime decides what to do with received messages
 - no auth — filesystem permissions are the auth (until adapters land)
 - no notification UI — distros add that
+- no cross-machine relay yet — the filesystem transport is local-only; ssh / unix-socket adapters are on the roadmap
+- no opinion on which agents talk — claude code is the first-class target via the hook, but the CLI works in cursor, codex, continue, your own bash script, anything that can `exec`
 
 this is a primitive, not a platform.
 
@@ -99,7 +120,7 @@ i was running three claude code sessions in parallel — one per repo, one per b
 
 so i wrote this. the whole tool is in [`bin/claude-peer`](bin/claude-peer). go read it.
 
-day 6 of [30 days, 30 tools](https://github.com/ferazfhansurie).
+day 7 of [30 days, 30 tools](https://github.com/ferazfhansurie).
 
 ## license
 
